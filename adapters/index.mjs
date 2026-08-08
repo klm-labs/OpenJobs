@@ -16,6 +16,9 @@ import * as breezy from './breezy.mjs';
 import * as bamboohr from './bamboohr.mjs';
 import * as jobvite from './jobvite.mjs';
 import * as joincom from './join.mjs';
+import * as a16zSpeedrun from './a16z-speedrun.mjs';
+import * as getro from './getro.mjs';
+import * as consider from './consider.mjs';
 
 export const ADAPTERS = [
   greenhouse,
@@ -31,6 +34,9 @@ export const ADAPTERS = [
   bamboohr,
   jobvite,
   joincom,
+  a16zSpeedrun,
+  getro,
+  consider,
 ];
 
 /**

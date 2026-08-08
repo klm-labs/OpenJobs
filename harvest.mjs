@@ -351,7 +351,10 @@ async function main() {
       totalAfterDedup++;
 
       rows.push({
-        company:         company.name || company.display_name || '',
+        // Board-wide aggregator adapters (a16z-speedrun, getro, consider) return
+        // one feed for many employers — prefer the per-job company they report
+        // over the routed record's name (a fund/network, not the real employer).
+        company:         j.company || company.name || company.display_name || '',
         industry:        company.industry_category || company.type || '',
         role:            j.title,
         location:        j.location || '',
