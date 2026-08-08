@@ -18,6 +18,14 @@
 // These boards are large (1000-2000+ jobs total) served newest-first, so we
 // paginate with a hard page cap rather than an age cutoff (this repo's
 // harvest.mjs applies posted-date filtering downstream; adapters just fetch).
+//
+// No retry logic previously meant one bare try/catch around the whole loop —
+// a single transient blip silently truncated the result to whatever was
+// collected so far. Retry transient errors (429/5xx) before propagating.
+// Note: api.getro.com has also been observed returning a persistent 406
+// after heavy same-session request volume — that's a different, non-transient
+// block retry won't fix (406 isn't in the retry set on purpose), distinct
+// from an ordinary rate-limit blip.
 
 export const ATS = 'getro';
 
@@ -27,6 +35,30 @@ const HITS_PER_PAGE = 20;   // API hard-caps page size at 20 (confirmed: request
 // truncating those to ~3% of the real board. This is a runaway guard, not a
 // coverage target: the loop already stops at the API's own `count` field.
 const MAX_PAGES = 2000;     // safety cap: 2000 x 20 = 40,000 newest jobs/board
+const RETRY_STATUSES = [429, 502, 503, 504];
+const MAX_RETRIES = 3;
+const RETRY_BASE_MS = 1500;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function statusFromError(err) {
+  const m = /HTTP (\d+)/.exec(err?.message || '');
+  return m ? Number(m[1]) : null;
+}
+
+async function fetchJsonWithRetry(ctx, url, opts) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await ctx.fetchJson(url, opts);
+    } catch (err) {
+      const status = statusFromError(err);
+      if (attempt >= MAX_RETRIES || !RETRY_STATUSES.includes(status)) throw err;
+      await sleep(RETRY_BASE_MS * 2 ** attempt);
+    }
+  }
+}
 
 export function detect(company) {
   const id = company?.getro_collection;
@@ -63,7 +95,7 @@ export async function fetchJobs(handle, ctx) {
   try {
     let total = Infinity;
     for (let page = 0; page < MAX_PAGES && page * HITS_PER_PAGE < total; page++) {
-      const json = await ctx.fetchJson(handle.apiUrl, {
+      const json = await fetchJsonWithRetry(ctx, handle.apiUrl, {
         method: 'POST',
         // apiUrl is pinned to api.getro.com — don't follow a 3xx off that host.
         redirect: 'error',

@@ -9,6 +9,15 @@
 // API: https://speedrun-talent-network.com/api/v1/jobs?page=N&source=career-ops
 //   0-indexed pages, 50/page. Response: { jobs: [...], total_pages, ... }
 // Public, zero-auth.
+//
+// A 355-page sweep is one bare try/catch around the whole loop away from a
+// single transient blip silently truncating the result to whatever was
+// collected so far — confirmed as the real cause of a session-observed gap
+// (17,727 real jobs live-checked, but a full sweep run only returned
+// 12,650): the API itself was healthy (a direct probe got a clean 200
+// immediately after), so something mid-walk failed once and the missing
+// retry logic just gave up rather than being an ongoing block. Retry
+// transient errors before propagating.
 
 export const ATS = 'a16z-speedrun';
 
@@ -22,6 +31,30 @@ const PER_PAGE = 50;
 const DEFAULT_MAX_PAGES = 500;
 // Runaway guard, not a coverage target — sits well above plausible board size.
 const MAX_PAGES_CAP = 1000;
+const RETRY_STATUSES = [429, 502, 503, 504];
+const MAX_RETRIES = 3;
+const RETRY_BASE_MS = 1500;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function statusFromError(err) {
+  const m = /HTTP (\d+)/.exec(err?.message || '');
+  return m ? Number(m[1]) : null;
+}
+
+async function fetchJsonWithRetry(ctx, url, opts) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await ctx.fetchJson(url, opts);
+    } catch (err) {
+      const status = statusFromError(err);
+      if (attempt >= MAX_RETRIES || !RETRY_STATUSES.includes(status)) throw err;
+      await sleep(RETRY_BASE_MS * 2 ** attempt);
+    }
+  }
+}
 
 function candidateUrls(company) {
   const urls = [];
@@ -97,7 +130,7 @@ export async function fetchJobs(handle, ctx) {
       const params = new URLSearchParams({ page: String(page), source: 'career-ops' });
       const url = `${FEED_BASE}?${params}`;
       // redirect:'error' prevents SSRF via server-side redirects off-host.
-      const json = await ctx.fetchJson(url, { redirect: 'error' });
+      const json = await fetchJsonWithRetry(ctx, url, { redirect: 'error' });
       const jobs = Array.isArray(json?.jobs) ? json.jobs : [];
       for (const j of jobs) {
         const normalized = normalizeJob(j);
