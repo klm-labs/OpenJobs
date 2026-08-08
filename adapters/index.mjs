@@ -19,6 +19,7 @@ import * as joincom from './join.mjs';
 import * as a16zSpeedrun from './a16z-speedrun.mjs';
 import * as getro from './getro.mjs';
 import * as consider from './consider.mjs';
+import * as workableSearch from './workable-search.mjs';
 
 export const ADAPTERS = [
   greenhouse,
@@ -37,6 +38,7 @@ export const ADAPTERS = [
   a16zSpeedrun,
   getro,
   consider,
+  workableSearch,
 ];
 
 /**
