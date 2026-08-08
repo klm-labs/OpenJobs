@@ -4,8 +4,32 @@
 //   body: {}  (pagination: { token: <nextPage from prev response> })
 //   response: { total, results: [...], nextPage: "<base64 token>" | null }
 // Public board URL: https://apply.workable.com/{slug}/
+//
+// hardCap was 500 with no reference to the API's own `total` field — same
+// truncation-bug class already found and fixed in getro/consider/
+// a16z-speedrun/workday/smartrecruiters this session. Raised well past any
+// single-company board size (`total` naturally bounds the loop for normal
+// companies; this is a runaway guard, not a coverage target).
+//
+// apply.workable.com shares Workable's aggressive IP rate limiting with
+// jobs.workable.com (confirmed live this session: a sustained 429 that
+// outlasted a 62s exponential backoff) — retry transient errors rather than
+// letting one blip during a full harvest sweep silently zero out a company.
 
 export const ATS = 'workable';
+
+const RETRY_STATUSES = [429, 502, 503, 504];
+const MAX_RETRIES = 3;
+const RETRY_BASE_MS = 1500;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function statusFromError(err) {
+  const m = /HTTP (\d+)/.exec(err?.message || '');
+  return m ? Number(m[1]) : null;
+}
 
 const HOST_PATTERNS = [
   /apply\.workable\.com\/api\/v3\/accounts\/([^/?#]+)/i,
@@ -62,7 +86,7 @@ function joinLocation(loc) {
   return parts.join(', ');
 }
 
-async function postJson(url, body, ctx) {
+async function postJsonOnce(url, body, ctx) {
   if (ctx?.fetchJson && ctx.fetchJson.length >= 2) {
     try {
       return await ctx.fetchJson(url, {
@@ -70,7 +94,12 @@ async function postJson(url, body, ctx) {
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify(body),
       });
-    } catch (_) { /* fall through */ }
+    } catch (err) {
+      // Only fall through to a direct fetch for helper-shape issues, not HTTP
+      // errors — an HTTP error is real signal (e.g. 429) that retry logic
+      // above this call needs to see, not something to silently swallow.
+      if (statusFromError(err) !== null) throw err;
+    }
   }
   const res = await fetch(url, {
     method: 'POST',
@@ -81,17 +110,31 @@ async function postJson(url, body, ctx) {
   return res.json();
 }
 
+async function postJson(url, body, ctx) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await postJsonOnce(url, body, ctx);
+    } catch (err) {
+      const status = statusFromError(err);
+      if (attempt >= MAX_RETRIES || !RETRY_STATUSES.includes(status)) throw err;
+      await sleep(RETRY_BASE_MS * 2 ** attempt);
+    }
+  }
+}
+
 export async function fetchJobs(handle, ctx) {
   if (!handle?.apiUrl) return [];
   const all = [];
-  const hardCap = 500;
+  const hardCap = 20000; // runaway guard, not a coverage target — see header comment
   try {
     let token = null;
     let guard = 0;
-    while (all.length < hardCap && guard < 30) {
+    let total = Infinity;
+    while (all.length < hardCap && all.length < total && guard < 250) {
       guard++;
       const body = token ? { token } : {};
       const json = await postJson(handle.apiUrl, body, ctx);
+      if (typeof json?.total === 'number' && json.total > 0) total = json.total;
       const results = json?.results || [];
       if (!Array.isArray(results) || results.length === 0) break;
       for (const j of results) {
