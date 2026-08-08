@@ -60,13 +60,19 @@ function joinLocation(loc) {
 export async function fetchJobs(handle, ctx) {
   if (!handle?.apiBase) return [];
   const all = [];
-  const limit = 100;
-  const hardCap = 1000;
+  const limit = 100;   // API hard-caps page size at 100 regardless of a larger `limit` param
+  // Offset pagination is real here (confirmed live against Bosch Group's board,
+  // 4,764 total jobs — offset:0, offset:2000, and offset:4000 each returned
+  // distinct job IDs with a consistent `totalFound`). A prior hardCap of 1000
+  // silently truncated boards like that one to ~21% of their real size. This
+  // is a runaway guard, not a coverage target: the loop already stops at the
+  // API's own `totalFound` field.
+  const hardCap = 20000;
   try {
     let offset = 0;
     let total = Infinity;
     let guard = 0;
-    while (offset < total && all.length < hardCap && guard < 20) {
+    while (offset < total && all.length < hardCap && guard < 250) {
       guard++;
       const url = `${handle.apiBase}?limit=${limit}&offset=${offset}`;
       const json = await ctx.fetchJson(url);
