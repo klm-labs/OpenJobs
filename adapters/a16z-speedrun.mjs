@@ -15,10 +15,12 @@ export const ATS = 'a16z-speedrun';
 const FEED_BASE = 'https://speedrun-talent-network.com/api/v1/jobs';
 const TRUSTED_HOST = 'speedrun-talent-network.com';
 const PER_PAGE = 50;
-const DEFAULT_MAX_PAGES = 6; // × PER_PAGE = 300-job default scan
-// Runaway guard, not a coverage target — iteration already stops at the
-// feed's reported total_pages (or a short page), so an honest feed never
-// hits this. Sits well above plausible board size.
+// The board is ~355 pages / ~17.7k jobs as of 2026-08-08 — this must stay
+// comfortably above that (not 6, which silently truncated a full-board sweep
+// to 300 jobs). Iteration still stops at the feed's reported total_pages (or
+// a short page) well before this default is exhausted on an honest feed.
+const DEFAULT_MAX_PAGES = 500;
+// Runaway guard, not a coverage target — sits well above plausible board size.
 const MAX_PAGES_CAP = 1000;
 
 function candidateUrls(company) {

@@ -22,8 +22,11 @@
 export const ATS = 'getro';
 
 const API_BASE = 'https://api.getro.com/api/v2/collections';
-const HITS_PER_PAGE = 20;   // API hard-caps page size at 20
-const MAX_PAGES = 40;       // safety cap: 40 x 20 = 800 newest jobs/board
+const HITS_PER_PAGE = 20;   // API hard-caps page size at 20 (confirmed: requesting more still returns 20)
+// Some boards (e.g. Accel) run 26k+ jobs — 40 pages (800 jobs) was silently
+// truncating those to ~3% of the real board. This is a runaway guard, not a
+// coverage target: the loop already stops at the API's own `count` field.
+const MAX_PAGES = 2000;     // safety cap: 2000 x 20 = 40,000 newest jobs/board
 
 export function detect(company) {
   const id = company?.getro_collection;

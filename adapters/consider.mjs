@@ -19,7 +19,19 @@
 export const ATS = 'consider';
 
 const ENDPOINT_PATH = '/api-boards/search-jobs';
-const DEFAULT_SIZE = 500;
+// Server hard-caps `meta.size` at 1000 (confirmed: size:10000 returns a 422
+// "Input should be less than or equal to 1000").
+//
+// This is a hard platform ceiling, not a tunable page size: neither
+// `meta.from` nor `meta.page` change the returned results — tested directly
+// against Sequoia Capital's board (9,723 total jobs), requesting
+// {from:0,size:3} vs {from:3,size:3} vs {page:1,size:3} all returned the
+// identical top 3 jobs. The endpoint is a "top N by relevance/featured" read,
+// not an offset-paginated listing, so there is no way to reach jobs past
+// index 1000 through this API. A prior version of this file attempted
+// from-based pagination and silently fetched 10,000 duplicate rows (the same
+// 1,000 jobs 10 times) — don't reintroduce that.
+const MAX_SIZE = 1000;
 
 function candidateUrls(company) {
   const urls = [];
@@ -87,6 +99,32 @@ export function detect(company) {
   };
 }
 
+function normalizeJob(j, origin) {
+  const rawUrl = j.url || j.applyUrl || '';
+  if (!rawUrl) return null;
+  let detailUrl;
+  try {
+    detailUrl = new URL(rawUrl, origin).toString();
+  } catch {
+    return null;
+  }
+  const title = j.title || '';
+  const location = locationString(j);
+  return {
+    title,
+    detail_url: detailUrl,
+    apply_url: detailUrl,
+    location,
+    remote: !!j.remote || /\bremote\b/i.test(location),
+    department: '',
+    posted_date: toIsoDate(j.timeStamp),
+    employment_type: '',
+    // Portfolio jobs belong to the portfolio company, not the fund.
+    company: j.companyName || '',
+    raw: j,
+  };
+}
+
 export async function fetchJobs(handle, ctx) {
   if (!handle?.apiUrl) return [];
   try {
@@ -100,7 +138,7 @@ export async function fetchJobs(handle, ctx) {
         referer: handle.origin + '/jobs',
       },
       body: JSON.stringify({
-        meta: { size: DEFAULT_SIZE },
+        meta: { size: MAX_SIZE },
         board: { id: handle.boardId, isParent: true },
         query: { promoteFeatured: true },
       }),
@@ -109,29 +147,12 @@ export async function fetchJobs(handle, ctx) {
     const jobs = Array.isArray(json?.jobs) ? json.jobs : [];
     const out = [];
     for (const j of jobs) {
-      const rawUrl = j.url || j.applyUrl || '';
-      if (!rawUrl) continue;
-      let detailUrl;
-      try {
-        detailUrl = new URL(rawUrl, handle.origin).toString();
-      } catch {
-        continue;
-      }
-      const title = j.title || '';
-      const location = locationString(j);
-      out.push({
-        title,
-        detail_url: detailUrl,
-        apply_url: detailUrl,
-        location,
-        remote: !!j.remote || /\bremote\b/i.test(location),
-        department: '',
-        posted_date: toIsoDate(j.timeStamp),
-        employment_type: '',
-        // Portfolio jobs belong to the portfolio company, not the fund.
-        company: j.companyName || '',
-        raw: j,
-      });
+      const normalized = normalizeJob(j, handle.origin);
+      if (normalized) out.push(normalized);
+    }
+    // Platform ceiling, not our bug — see MAX_SIZE comment above.
+    if (typeof json?.total === 'number' && json.total > out.length && ctx?.logWarn) {
+      ctx.logWarn(`consider ${handle.boardId}: board reports ${json.total} jobs, API caps a single read at ${MAX_SIZE} with no working pagination — ${json.total - out.length} jobs unreachable`);
     }
     return out;
   } catch (err) {
