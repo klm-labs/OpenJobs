@@ -1,5 +1,6 @@
 # Outscal harvest inputs & outputs (large / personal)
 data/harvest-history.tsv
+data/workable-search-cursor.json
 data/companies*.backup-*
 output/jobs-*.csv
 output/jobs-manual-*.csv

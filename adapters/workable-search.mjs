@@ -18,6 +18,35 @@
 //   (`limit=50` -> HTTP 400 {"limit":"Must be less than or equal to 20"}).
 //   Response: { title, totalSize, nextPageToken, jobs: [...] }
 //   Optional filters (both verified): `query=<free text>`, `workplace=remote`.
+//
+// DESIGN NOTE — this adapter is intentionally NOT part of harvest.mjs's
+// default full sweep (see harvest.mjs's OPT_IN_ATS gate). A fresh clone of
+// this repo would otherwise blindly try to pull all ~168k jobs on its very
+// first run and immediately trip jobs.workable.com's IP rate limiter
+// (confirmed live during development — a sustained 429 that a 5-retry/32s
+// backoff still couldn't clear). Three safety nets instead:
+//
+//   1. Opt-in only — reachable via `--company "Workable Job Board"`,
+//      `--ats workable-search`, or `--include-aggregators`; skipped by a bare
+//      `node harvest.mjs`.
+//   2. Server-side filtering — `handle.query` (harvest's --workable-query)
+//      and `handle.remoteOnly` (--workable-remote) narrow the search on
+//      Workable's side, so a scoped run fetches a few hundred relevant jobs
+//      instead of walking the whole board.
+//   3. Resumable cursor — each run fetches only DEFAULT_PAGES_PER_RUN pages
+//      (handle.maxPages / --workable-max-pages to override) and persists its
+//      `pageToken` to data/workable-search-cursor.json (gitignored), so
+//      repeated runs walk the board incrementally across days instead of
+//      re-fetching page 1 or trying to do it all in one sitting. The cursor
+//      is keyed by the filter combo (query + remoteOnly) so differently
+//      filtered runs walk independently. When the board is exhausted the
+//      cursor is cleared, so the next run starts a fresh cycle and picks up
+//      newly-posted jobs. `handle.resetCursor` (--workable-reset) forces a
+//      restart from page 1.
+
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
 
 export const ATS = 'workable-search';
 
@@ -29,27 +58,56 @@ const TRUSTED_HOST = 'jobs.workable.com';
 const SENTINEL_PATH = '/search';
 // Server-enforced page size — not tunable.
 const PER_PAGE = 20;
-// The board is ~168.4k jobs / ~8,423 pages at 20/page as of 2026-08-08. This
-// default must stay comfortably above that so a full sweep is actually
-// reachable (cf. a16z-speedrun, whose DEFAULT_MAX_PAGES=6 silently truncated
-// a 17.7k-job feed to 300). Iteration still stops early on a missing
-// nextPageToken, a short page, or once totalSize has been covered.
-const DEFAULT_MAX_PAGES = 12000;
-// Runaway guard, not a coverage target — sits well above plausible board size.
-const MAX_PAGES_CAP = 25000;
+// Default pages fetched PER RUN, not a full-sweep target — deliberately small
+// (40 pages = 800 jobs) so a first-time `node harvest.mjs --company "Workable
+// Job Board"` is fast and gentle on the rate limiter. Override with
+// handle.maxPages (harvest.mjs's --workable-max-pages) for a bigger bite, or
+// just run it repeatedly — the cursor below carries you further each time.
+const DEFAULT_PAGES_PER_RUN = 40;
+// Runaway guard for a single run, not a coverage target — the board is
+// ~168.4k jobs / ~8,423 pages, so this sits comfortably above any sane
+// --workable-max-pages override while still bounding a single invocation.
+const MAX_PAGES_CAP = 10000;
 // jobs.workable.com IP-rate-limits aggressively (confirmed live: a 429 after
-// heavy testing) — the repo's own docs already flag apply.workable.com/{slug}
-// as the same. A full sweep is ~8,423 pages, so without retry a single 429
-// mid-sweep silently truncates the whole board (observed: stopped at 7,560
-// jobs / ~378 pages). Retry with backoff, and pace requests to reduce how
-// often the limiter trips in the first place.
+// heavy testing that even 5 retries with exponential backoff couldn't clear).
+// Retry transient errors, and pace requests to reduce how often the limiter
+// trips in the first place.
 const RETRY_STATUSES = [429, 502, 503, 504];
 const MAX_RETRIES = 5;
 const RETRY_BASE_MS = 2000;
-const PACE_MS = 150;
+const PACE_MS = 400;
+
+const CURSOR_PATH = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'data', 'workable-search-cursor.json');
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Cursor state is keyed by the query/remoteOnly combo so different filtered
+// runs (e.g. "growth marketing" vs "engineering") each walk independently.
+function cursorKey(handle) {
+  return JSON.stringify({ q: handle?.query || '', remote: !!handle?.remoteOnly });
+}
+
+function loadCursor(key) {
+  if (!existsSync(CURSOR_PATH)) return null;
+  try {
+    const all = JSON.parse(readFileSync(CURSOR_PATH, 'utf-8'));
+    return all[key] || null;
+  } catch {
+    return null;
+  }
+}
+
+function saveCursor(key, entry) {
+  let all = {};
+  if (existsSync(CURSOR_PATH)) {
+    try { all = JSON.parse(readFileSync(CURSOR_PATH, 'utf-8')); } catch { /* start fresh */ }
+  }
+  if (entry === null) delete all[key];
+  else all[key] = entry;
+  mkdirSync(dirname(CURSOR_PATH), { recursive: true });
+  writeFileSync(CURSOR_PATH, JSON.stringify(all, null, 2));
 }
 
 function statusFromError(err) {
@@ -103,10 +161,10 @@ export function detect(company) {
   return null;
 }
 
-function resolveMaxPages(handle) {
+function resolvePagesPerRun(handle) {
   const v = handle?.maxPages;
   if (Number.isInteger(v) && v > 0) return Math.min(v, MAX_PAGES_CAP);
-  return DEFAULT_MAX_PAGES;
+  return DEFAULT_PAGES_PER_RUN;
 }
 
 function formatLocation(j) {
@@ -174,12 +232,26 @@ function normalizeJob(j) {
 
 export async function fetchJobs(handle, ctx) {
   if (!handle?.host) return [];
-  const maxPages = resolveMaxPages(handle);
+  const pagesPerRun = resolvePagesPerRun(handle);
+  const key = cursorKey(handle);
+
+  // Resume where the previous run stopped, unless explicitly reset.
+  const prev = handle?.resetCursor === true ? null : loadCursor(key);
+  let pageToken = typeof prev?.pageToken === 'string' ? prev.pageToken : '';
+  const resumed = !!pageToken;
+  let pagesWalked = Number.isInteger(prev?.pagesWalked) ? prev.pagesWalked : 0;
+
   const out = [];
   const seen = new Set();
-  let pageToken = '';
+  // `cycleDone` means the board was fully walked (or the saved token turned
+  // out to be unusable), so the cursor is cleared and the next run restarts
+  // from page 1 — which is also how newly-posted jobs get picked up.
+  let cycleDone = false;
+  let pagesThisRun = 0;
+  let totalSize = Number.isInteger(prev?.totalSize) ? prev.totalSize : null;
+
   try {
-    for (let page = 0; page < maxPages; page++) {
+    for (let page = 0; page < pagesPerRun; page++) {
       const params = new URLSearchParams();
       if (pageToken) params.set('pageToken', pageToken);
       if (typeof handle.query === 'string' && handle.query.trim()) {
@@ -188,12 +260,13 @@ export async function fetchJobs(handle, ctx) {
       if (handle.remoteOnly === true) params.set('workplace', 'remote');
       const qs = params.toString();
       const url = qs ? `${FEED_BASE}?${qs}` : FEED_BASE;
+      // Pace between requests (not before the first) to stay under the limiter.
+      if (page > 0) await sleep(PACE_MS);
       // redirect:'error' prevents SSRF via server-side redirects off-host.
       const json = await fetchJsonWithRetry(ctx, url, {
         redirect: 'error',
         headers: { Accept: 'application/json' },
       });
-      if (page > 0) await sleep(PACE_MS);
 
       const jobs = Array.isArray(json?.jobs) ? json.jobs : [];
       for (const j of jobs) {
@@ -203,16 +276,51 @@ export async function fetchJobs(handle, ctx) {
         const normalized = normalizeJob(j);
         if (normalized) out.push(normalized);
       }
+      pagesWalked++;
+      pagesThisRun++;
+      if (Number.isInteger(json?.totalSize)) totalSize = json.totalSize;
 
-      // Stop conditions, cheapest first.
-      if (jobs.length < PER_PAGE) break;
-      pageToken = typeof json?.nextPageToken === 'string' ? json.nextPageToken : '';
-      if (!pageToken) break;
-      if (Number.isInteger(json?.totalSize) && seen.size >= json.totalSize) break;
+      // End-of-board conditions, cheapest first. Any of them means this cycle
+      // is complete — the cursor gets cleared so the next run starts over.
+      if (jobs.length < PER_PAGE) { cycleDone = true; break; }
+      const next = typeof json?.nextPageToken === 'string' ? json.nextPageToken : '';
+      if (!next) { cycleDone = true; break; }
+      pageToken = next;
+      if (Number.isInteger(totalSize) && pagesWalked * PER_PAGE >= totalSize) { cycleDone = true; break; }
     }
-    return out;
   } catch (err) {
     if (ctx?.logWarn) ctx.logWarn(`workable-search: ${err.message}`);
-    return out;
+    // A resumed token rejected outright (4xx that isn't rate limiting) on the
+    // first request of the run is expired server-side — drop it so the next
+    // run isn't permanently stuck. Rate limiting / 5xx keep the cursor, since
+    // the token is presumably still fine and progress is worth preserving.
+    const status = statusFromError(err);
+    const tokenRejected = status >= 400 && status < 500 && !RETRY_STATUSES.includes(status);
+    if (resumed && pagesThisRun === 0 && tokenRejected) cycleDone = true;
   }
+
+  const cleared = cycleDone || !pageToken;
+  try {
+    if (cleared) {
+      // Cycle complete, or nothing worth resuming from (e.g. the first request
+      // of a fresh run failed) — clear so the next run starts at page 1.
+      saveCursor(key, null);
+    } else {
+      saveCursor(key, {
+        pageToken,
+        pagesWalked,
+        totalSize,
+        query: handle?.query || '',
+        remoteOnly: !!handle?.remoteOnly,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+  } catch (err) {
+    if (ctx?.logWarn) ctx.logWarn(`workable-search: cursor write failed: ${err.message}`);
+  }
+
+  if (ctx?.logWarn) {
+    ctx.logWarn(`workable-search: +${out.length} jobs, pages walked ${pagesWalked}${totalSize ? ` / ~${Math.ceil(totalSize / PER_PAGE)}` : ''}${cleared ? ' (cursor cleared — next run restarts at page 1)' : ' (cursor saved — next run resumes here)'}`);
+  }
+  return out;
 }

@@ -14,6 +14,25 @@
  *   node harvest.mjs --company "Voodoo"     # only one company (substring match)
  *   node harvest.mjs --no-filter            # skip title/location filtering
  *   node harvest.mjs --industry gaming      # only companies where industry_category matches
+ *
+ * Opt-in aggregators (see OPT_IN_ATS below):
+ *   Some adapters front board-wide aggregator feeds that are huge and
+ *   rate-limit-sensitive, so they are SKIPPED by a bare `node harvest.mjs`.
+ *   Reach them deliberately:
+ *     node harvest.mjs --ats workable-search --workable-query "growth marketing"
+ *     node harvest.mjs --company "Workable Job Board" --workable-remote
+ *     node harvest.mjs --include-aggregators        # add them to a full sweep
+ *
+ *   workable-search extras (ignored by every other adapter):
+ *     --workable-query "<text>"   server-side free-text search on Workable
+ *     --workable-remote           server-side workplace=remote filter
+ *     --workable-max-pages N      pages to fetch THIS run (default 40, 20/page)
+ *     --workable-reset            ignore the saved cursor, restart at page 1
+ *
+ *   workable-search walks the board incrementally: each run fetches a bounded
+ *   number of pages and saves its position to data/workable-search-cursor.json
+ *   (gitignored), so running it repeatedly over hours/days covers the board
+ *   without ever hammering jobs.workable.com in one sitting.
  */
 
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from 'fs';
@@ -33,6 +52,15 @@ const OUTPUT_DIR       = resolve(__dirname, 'output');
 
 const CONCURRENCY      = 10;
 const FETCH_TIMEOUT_MS = 15_000;
+
+// ATSes excluded from the default sweep. These are board-wide aggregator feeds
+// (one adapter = tens of thousands of jobs across thousands of employers) that
+// are slow and aggressively IP-rate-limited, so a fresh clone running a bare
+// `node harvest.mjs` must not touch them by accident. They stay reachable via
+// deliberate targeting: --ats <name>, --company <that record's name>, an
+// ats_allowlist entry in portals.yml, or --include-aggregators.
+// Add future big/fragile aggregators here rather than special-casing by name.
+const OPT_IN_ATS = new Set(['workable-search']);
 
 // ── CLI ─────────────────────────────────────────────────────────────
 
@@ -72,10 +100,20 @@ function expandCountries(csv) {
 }
 
 function parseArgs(argv) {
-  const args = { dryRun: false, limit: null, ats: null, company: null, noFilter: false, industry: null, country: null, locationOverride: null };
+  const args = {
+    dryRun: false, limit: null, ats: null, company: null, noFilter: false,
+    industry: null, country: null, locationOverride: null,
+    includeAggregators: false,
+    workableQuery: null, workableRemote: false, workableMaxPages: null, workableReset: false,
+  };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--dry-run') args.dryRun = true;
+    else if (a === '--include-aggregators') args.includeAggregators = true;
+    else if (a === '--workable-query') args.workableQuery = argv[++i];
+    else if (a === '--workable-remote') args.workableRemote = true;
+    else if (a === '--workable-max-pages') args.workableMaxPages = Number(argv[++i]);
+    else if (a === '--workable-reset') args.workableReset = true;
     else if (a === '--no-filter') args.noFilter = true;
     else if (a === '--limit') args.limit = Number(argv[++i]);
     else if (a === '--ats') args.ats = argv[++i].toLowerCase();
@@ -271,10 +309,31 @@ async function main() {
     console.log(`[location override] ${effectiveLocations.include.slice(0, 8).join(', ')}${effectiveLocations.include.length > 8 ? '…' : ''}`);
   }
 
+  // An opt-in aggregator runs only when the user targeted it deliberately:
+  // --ats <it>, an ats_allowlist entry naming it, --company (a name filter is
+  // already an explicit narrowing), or the blanket --include-aggregators.
+  const aggregatorRequested = (ats) =>
+    ARGS.includeAggregators || !!ARGS.company || atsAllowlist.includes(ats);
+
+  // Adapter-specific handle extras from the CLI. Scoped by ATS so these flags
+  // can never leak into another adapter's handle.
+  const decorateHandle = (ats, handle) => {
+    if (ats !== 'workable-search') return handle;
+    const extra = {};
+    if (ARGS.workableQuery) extra.query = ARGS.workableQuery;
+    if (ARGS.workableRemote) extra.remoteOnly = true;
+    if (Number.isInteger(ARGS.workableMaxPages) && ARGS.workableMaxPages > 0) {
+      extra.maxPages = ARGS.workableMaxPages;
+    }
+    if (ARGS.workableReset) extra.resetCursor = true;
+    return { ...handle, ...extra };
+  };
+
   // Partition companies
   const routed = [];
   const manual = [];
   const unrouted = [];
+  const skippedOptIn = [];
 
   for (const c of companies) {
     if (!industryPass(c)) continue;
@@ -290,11 +349,22 @@ async function main() {
     const route = routeCompany(c);
     if (route) {
       if (atsAllowlist.length && !atsAllowlist.includes(route.adapter.ATS)) continue;
-      routed.push({ company: c, ...route });
+      // Opt-in aggregators: only run when the user asked for them explicitly.
+      if (OPT_IN_ATS.has(route.adapter.ATS) && !aggregatorRequested(route.adapter.ATS)) {
+        skippedOptIn.push(route.adapter.ATS);
+        continue;
+      }
+      routed.push({ company: c, handle: decorateHandle(route.adapter.ATS, route.handle), adapter: route.adapter });
     } else {
       unrouted.push(c);
     }
   }
+
+  // Opt-in aggregators are the slowest single units of work in the pool, so
+  // start them first — they then run concurrently with everything else instead
+  // of trailing at the end of the queue. (See the note by OPT_IN_ATS on why a
+  // separate scheduler isn't needed.)
+  routed.sort((a, b) => (OPT_IN_ATS.has(b.adapter.ATS) ? 1 : 0) - (OPT_IN_ATS.has(a.adapter.ATS) ? 1 : 0));
 
   if (ARGS.limit) routed.length = Math.min(ARGS.limit, routed.length);
 
@@ -302,6 +372,12 @@ async function main() {
   console.log(`Flagged manual (LinkedIn/Wellfound etc): ${manual.length}`);
   console.log(`Unrouted (no known ATS — Tier 2 scope): ${unrouted.length}`);
   if (ARGS.limit) console.log(`[--limit ${ARGS.limit}] capping to ${routed.length} routable`);
+  if (skippedOptIn.length) {
+    console.log(`Skipped opt-in aggregators: ${Array.from(new Set(skippedOptIn)).join(', ')} (run with --ats <name> or --include-aggregators)`);
+  }
+  if (ARGS.workableQuery || ARGS.workableRemote) {
+    console.log(`[workable-search] server-side filter: query="${ARGS.workableQuery || ''}"${ARGS.workableRemote ? ' workplace=remote' : ''}`);
+  }
   console.log('');
 
   // Adapter counts
