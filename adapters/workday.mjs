@@ -86,17 +86,29 @@ export async function fetchJobs(handle, ctx) {
   if (!handle?.apiUrl) return [];
   const all = [];
   const pageSize = 20;
-  const hardCap = 500;
+  // Confirmed live (NVIDIA, Adobe boards): Workday's CXS API only returns a
+  // real `total` on the first page (offset 0) — every subsequent page
+  // reports `total: 0`. The old code did `if (typeof json.total ===
+  // 'number') total = json.total`, which is true for 0 too, so on page 2 the
+  // loop's `offset < total` bound collapsed to `20 < 0` and pagination
+  // silently stopped after 40 jobs regardless of the real board size (e.g.
+  // NVIDIA reports total:2000 but the adapter returned only 40; Adobe
+  // reports total:792, adapter returned 40). Fix: only adopt a reported
+  // total when it's positive, so a later zero can't clobber the real bound.
+  // hardCap raised well past the largest boards seen (NVIDIA reports 2000 —
+  // itself a known Workday display ceiling, not necessarily the true count)
+  // with a generous safety margin.
+  const hardCap = 5000;
   try {
     let offset = 0;
     let total = Infinity;
     let guard = 0;
-    while (offset < total && all.length < hardCap && guard < 30) {
+    while (offset < total && all.length < hardCap && guard < 300) {
       guard++;
       const body = { appliedFacets: {}, limit: pageSize, offset, searchText: '' };
       const json = await postJson(handle.apiUrl, body, ctx);
       const postings = json?.jobPostings || [];
-      if (typeof json?.total === 'number') total = json.total;
+      if (typeof json?.total === 'number' && json.total > 0) total = json.total;
       if (!Array.isArray(postings) || postings.length === 0) break;
       for (const p of postings) {
         const title = p.title || '';
